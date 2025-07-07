@@ -1,17 +1,16 @@
 import os
 import notion_client
 from serpapi import GoogleSearch
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- CONFIGURAÇÃO ---
-# As chaves serão lidas das "Secrets" do GitHub, não diretamente aqui.
 NOTION_KEY = os.getenv("NOTION_KEY")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+# NOVO: ID da página principal onde as páginas diárias serão criadas.
+NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 # Inicializa os clientes das APIs
 notion = notion_client.Client(auth=NOTION_KEY)
-serpapi_client = GoogleSearch({"api_key": SERPAPI_API_KEY})
 
 # --- DEFINIÇÃO DAS CATEGORIAS E BUSCAS ---
 CATEGORIAS = {
@@ -37,7 +36,7 @@ CATEGORIAS = {
     }
 }
 
-def busca_noticias(termo_busca, engine="google", dominio_site=None):
+def busca_noticias(termo_busca, engine="google"):
     """Realiza a busca de notícias usando a SerpApi."""
     print(f"Buscando em '{engine}' por: '{termo_busca}'...")
     params = {
@@ -45,98 +44,111 @@ def busca_noticias(termo_busca, engine="google", dominio_site=None):
         "api_key": SERPAPI_API_KEY,
         "engine": engine,
     }
-
-    # Filtro para notícias das últimas 24 horas
     if engine == "google":
-        params.update({"tbm": "nws", "tbs": "qdr:d"}) # qdr:d = last 24 hours
+        params.update({"tbm": "nws", "tbs": "qdr:d"})
     elif engine == "youtube":
-        params.update({"sp": "CAI%3D"}) # sp: CAI%3D = Last 24 hours
-    
-    if dominio_site:
-        params["q"] = f"{termo_busca} site:{dominio_site}"
+        params.update({"sp": "CAI%3D"})
 
     try:
         results = GoogleSearch(params).get_dict()
-        
-        if "news_results" in results:
-            return results.get("news_results", [])
-        if "video_results" in results:
-            return results.get("video_results", [])
-        if "organic_results" in results: # Para Twitter e Reddit
-            return results.get("organic_results", [])
-        if "scholar_articles" in results:
-            return results.get("scholar_articles", [])
-
+        if "news_results" in results: return results.get("news_results", [])
+        if "video_results" in results: return results.get("video_results", [])
+        if "organic_results" in results: return results.get("organic_results", [])
+        if "scholar_articles" in results: return results.get("scholar_articles", [])
     except Exception as e:
         print(f"Erro ao buscar notícias para '{termo_busca}': {e}")
     return []
 
+def find_or_create_daily_page(parent_page_id):
+    """Encontra ou cria uma página para o dia atual."""
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    page_title = f"Notícias de IA - {today_str}"
 
-def adiciona_no_notion(titulo, resumo, link, categoria, fonte, data_publicacao_str):
-    """Adiciona um item ao banco de dados do Notion."""
     try:
-        # Tenta converter a data para o formato ISO 8601
-        # A data da SerpApi pode vir em formatos variados
-        try:
-            data_obj = datetime.strptime(data_publicacao_str, "%Y-%m-%d")
-            data_iso = data_obj.isoformat()
-        except (ValueError, TypeError):
-            # Se falhar, usa a data atual como fallback
-            data_iso = datetime.now().isoformat()
-
-        notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "Título": {"title": [{"text": {"content": titulo}}]},
-                "Resumo": {"rich_text": [{"text": {"content": resumo}}]},
-                "Link": {"url": link},
-                "Categoria": {"select": {"name": categoria}},
-                "Fonte": {"select": {"name": fonte.capitalize()}},
-                "Data da Publicação": {"date": {"start": data_iso}}
-            }
-        )
-        print(f"  -> Sucesso! Notícia '{titulo}' adicionada ao Notion.")
+        results = notion.search(query=page_title, filter={"property": "object", "value": "page"}).get("results")
+        for page in results:
+            if page.get("parent", {}).get("page_id") == parent_page_id and not page.get("archived"):
+                print(f"Página do dia encontrada: {page['id']}")
+                return page['id']
     except Exception as e:
-        print(f"  -> ERRO ao adicionar '{titulo}' ao Notion: {e}")
+        print(f"Erro ao buscar página: {e}")
+
+    try:
+        print(f"Criando nova página para o dia: {page_title}")
+        new_page = notion.pages.create(
+            parent={"page_id": parent_page_id},
+            properties={"title": [{"text": {"content": page_title}}]},
+            children=[
+                {"type": "heading_1", "heading_1": {"rich_text": [{"type": "text", "text": {"content": page_title}}]}},
+                {"type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "Resumo das notícias de Inteligência Artificial encontradas nas últimas 24 horas."}}]}},
+                {"type": "divider", "divider": {}}
+            ]
+        )
+        return new_page["id"]
+    except Exception as e:
+        print(f"Erro ao criar a página do dia: {e}")
+        return None
+
+def append_blocks_to_page(page_id, blocks):
+    """Adiciona blocos de conteúdo a uma página."""
+    if not page_id or not blocks: return
+    try:
+        notion.blocks.children.append(block_id=page_id, children=blocks)
+        print(f"  -> Sucesso! {len(blocks)} blocos de conteúdo adicionados à página do dia.")
+    except Exception as e:
+        print(f"  -> ERRO ao adicionar blocos à página: {e}")
 
 def get_fonte_from_engine(engine):
-    if engine == "google" or engine == "google_scholar":
-        return "Portal"
-    if engine == "twitter":
-        return "X.com"
+    if engine in ["google", "google_scholar"]: return "Portal"
+    if engine == "twitter": return "X.com"
     return engine.capitalize()
 
 # --- FLUXO PRINCIPAL ---
 if __name__ == "__main__":
     print("Iniciando o assistente de pesquisa de notícias de IA...")
     
+    daily_page_id = find_or_create_daily_page(NOTION_PAGE_ID)
+    if not daily_page_id:
+        print("Não foi possível encontrar ou criar a página do dia. Encerrando.")
+        exit()
+
+    all_news_blocks = []
     for categoria, config in CATEGORIAS.items():
         print(f"\n--- Processando Categoria: {categoria} ---")
-        termos = config["termos"]
         
+        category_blocks = []
         for fonte_engine in config["fontes"]:
-            resultados = busca_noticias(termos, engine=fonte_engine)
-            
+            resultados = busca_noticias(config["termos"], engine=fonte_engine)
             if not resultados:
                 print(f"Nenhum resultado encontrado em '{fonte_engine}' para esta categoria.")
                 continue
 
-            # Pega os 2 primeiros resultados para não exceder o limite da API
             for item in resultados[:2]:
-                try:
-                    titulo = item.get("title")
-                    link = item.get("link")
-                    resumo = item.get("snippet", "Resumo não disponível.")
-                    data_publicacao = item.get("date", datetime.now().strftime("%Y-%m-%d"))
+                titulo = item.get("title")
+                link = item.get("link")
+                resumo = item.get("snippet", "Resumo não disponível.")
+                if not all([titulo, link]): continue
+                
+                fonte_nome = get_fonte_from_engine(fonte_engine)
+                
+                news_text = [
+                    {"type": "text", "text": {"content": f"{titulo}", "link": {"url": link}}},
+                    {"type": "text", "text": {"content": f" – {fonte_nome}"}},
+                    {"type": "text", "text": {"content": f"\n{resumo}"}, "annotations": {"italic": True}}
+                ]
+                category_blocks.append({
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": news_text}
+                })
 
-                    if not all([titulo, link]):
-                        continue
-                    
-                    fonte_nome = get_fonte_from_engine(fonte_engine)
-                    adiciona_no_notion(titulo, resumo, link, categoria, fonte_nome, data_publicacao)
+        if category_blocks:
+            all_news_blocks.append({"type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": categoria}}]}})
+            all_news_blocks.extend(category_blocks)
+            all_news_blocks.append({"type": "divider", "divider": {}})
 
-                except KeyError as e:
-                    print(f"Item ignorado por falta de chave: {e}")
-                    continue
-    
+    if all_news_blocks:
+        append_blocks_to_page(daily_page_id, all_news_blocks)
+    else:
+        print("\nNenhuma notícia encontrada hoje.")
+
     print("\nProcesso finalizado.")
