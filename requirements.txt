@@ -1,0 +1,2 @@
+notion-client
+google-search-results-python
